@@ -17,12 +17,18 @@ limitations under the License.
 package hpelustre
 
 import (
+	"cmp"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	csicommon "github.com/HewlettPackard/lustre-csi-driver/pkg/csi-common"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"golang.org/x/sys/unix"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
@@ -90,7 +96,39 @@ type DriverOptions struct {
 	SwapSourceFrom     string
 	SwapSourceTo       string
 	SwapSourceToFSType string
+
+	// Whether PVs may have a failoverVolumeHandle.
+	EnableFailover bool
+	// Node-local directory recording which side each failover volume was
+	// mounted from.
+	FailoverStateDir string
+	// Whether to force-unmount mounts of the side that a volume has failed
+	// away from.
+	FailoverForceUnmountStale bool
+
+	// How long NodePublishVolume and NodeUnpublishVolume wait for a mount or
+	// an unmount, which then continues in the background.
+	OperationTimeout time.Duration
+	// How long a mounted volume may take to answer statfs before it is
+	// deemed unresponsive.
+	StatfsTimeout time.Duration
+	// Whether to ping MGSs over LNet.
+	LNetPing        bool
+	LNetPingTimeout time.Duration
+	// Whether to refuse to mount from an MGS that doesn't answer LNet pings.
+	CheckMGSBeforeMount bool
+	// How often to report the LNet health of the MGSs of failover PVs. 0 to
+	// not report it.
+	HealthReportInterval time.Duration
+	// Namespace of the health Leases. The driver's own if empty.
+	HealthNamespace string
 }
+
+const (
+	defaultOperationTimeout = 90 * time.Second
+	defaultStatfsTimeout    = 30 * time.Second
+	defaultLNetPingTimeout  = 5 * time.Second
+)
 
 // Driver implements all interfaces of CSI drivers
 type Driver struct {
@@ -103,7 +141,8 @@ type Driver struct {
 	mounter                  *mount.SafeFormatAndMount
 	forceMounter             *mount.MounterForceUnmounter
 	// Directory to temporarily mount to for subdirectory creation
-	workingMountDir  string
+	workingMountDir string
+	// Serializes mounts until the Lustre kernel modules are loaded.
 	kernelModuleLock sync.Mutex
 
 	// Used for testing. Allows the .spec.csi.volumeHandle to be swapped with
@@ -112,6 +151,31 @@ type Driver struct {
 	swapSourceFrom     string
 	swapSourceTo       string
 	swapSourceToFSType string
+
+	enableFailover            bool
+	failoverStateDir          string
+	failoverForceUnmountStale bool
+	failover                  *failoverManager
+
+	// Node operations in progress, by target path.
+	ops *targetOps
+	// statfs calls in progress, by volume path.
+	statfsOps            *targetOps
+	operationTimeout     time.Duration
+	statfsTimeout        time.Duration
+	lnetPing             bool
+	lnetPingTimeout      time.Duration
+	checkMGSBeforeMount  bool
+	healthReportInterval time.Duration
+	healthNamespace      string
+	// LNet health of MGSs. Nil if MGSs are not pinged.
+	health *healthChecker
+
+	// Replaced in tests.
+	statVolume          func(path string) (*csi.NodeGetVolumeStatsResponse, error)
+	findMount           func(path string) (*mount.MountInfo, error)
+	unmount             func(path string, flags int) error
+	lustreModulesLoaded func() bool
 }
 
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
@@ -132,6 +196,25 @@ func NewDriver(options *DriverOptions) *Driver {
 	d.swapSourceFrom = options.SwapSourceFrom
 	d.swapSourceTo = options.SwapSourceTo
 	d.swapSourceToFSType = options.SwapSourceToFSType
+
+	d.enableFailover = options.EnableFailover
+	d.failoverStateDir = options.FailoverStateDir
+	d.failoverForceUnmountStale = options.FailoverForceUnmountStale
+
+	d.ops = newTargetOps()
+	d.statfsOps = newTargetOps()
+	d.operationTimeout = cmp.Or(options.OperationTimeout, defaultOperationTimeout)
+	d.statfsTimeout = cmp.Or(options.StatfsTimeout, defaultStatfsTimeout)
+	d.lnetPing = options.LNetPing
+	d.lnetPingTimeout = cmp.Or(options.LNetPingTimeout, defaultLNetPingTimeout)
+	d.checkMGSBeforeMount = options.CheckMGSBeforeMount
+	d.healthReportInterval = options.HealthReportInterval
+	d.healthNamespace = options.HealthNamespace
+
+	d.statVolume = statVolume
+	d.findMount = findMount
+	d.unmount = unix.Unmount
+	d.lustreModulesLoaded = lustreModulesLoaded
 
 	return &d
 }
@@ -156,6 +239,32 @@ func (d *Driver) Run(endpoint string, testBool bool) {
 		klog.Fatalf("Mounter does not support force unmount")
 	}
 
+	if d.lnetPing {
+		d.health = newHealthChecker(lnetPing(lnetDevice, lnetModulePath, d.lnetPingTimeout), d.lnetPingTimeout)
+		klog.Infof("Pinging MGSs over LNet, with a timeout of %v", d.lnetPingTimeout)
+	}
+
+	if d.enableFailover {
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			klog.Fatalf("Failover requires in-cluster API access: %v", err)
+		}
+		client, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			klog.Fatalf("%v", err)
+		}
+		stopCh := make(chan struct{})
+		d.failover, err = newFailoverManager(client, d.Name, d.failoverStateDir,
+			d.failoverForceUnmountStale, stopCh)
+		if err != nil {
+			klog.Fatalf("Could not start failover support: %v", err)
+		}
+		klog.Infof("Failover enabled")
+		if d.health != nil && d.healthReportInterval > 0 {
+			d.startHealthReporter(client, stopCh)
+		}
+	}
+
 	// TODO_JUSJIN: revisit these caps
 	// Initialize default library driver
 	// TODO_CHYIN: move this to {service}.go
@@ -167,6 +276,30 @@ func (d *Driver) Run(endpoint string, testBool bool) {
 	// Driver d act as IdentityServer, ControllerServer and NodeServer
 	s.Start(endpoint, d, d, d, testBool)
 	s.Wait()
+}
+
+// startHealthReporter reports the LNet health of the MGSs of failover PVs in
+// this node's health Lease, once PVs are synced.
+func (d *Driver) startHealthReporter(client kubernetes.Interface, stopCh <-chan struct{}) {
+	namespace, err := healthNamespace(d.healthNamespace)
+	if err != nil {
+		klog.Warningf("Not reporting LNet health: %v", err)
+		return
+	}
+	reporter := &healthReporter{
+		checker:  d.health,
+		interval: d.healthReportInterval,
+		sides:    d.failover.sides,
+		publish:  leasePublisher(client, namespace, d.NodeID, 3*d.healthReportInterval),
+		event:    nodeEventRecorder(client, d.Name, d.NodeID),
+	}
+	go func() {
+		if cache.WaitForCacheSync(stopCh, d.failover.synced) {
+			reporter.run(stopCh)
+		}
+	}()
+	klog.Infof("Reporting LNet health every %v in Lease %s/%s",
+		d.healthReportInterval, namespace, healthLeaseName(d.NodeID))
 }
 
 func IsCorruptedDir(dir string) bool {

@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/HewlettPackard/lustre-csi-driver/pkg/hpelustre"
 	"k8s.io/klog/v2"
@@ -43,6 +44,16 @@ var (
 	swapSourceFrom           = flag.String("swap-source-from", "", "source as specified in PV's spec.csi.volumeHandle to be swapped")
 	swapSourceTo             = flag.String("swap-source-to", "", "source to be used in place of the PV's spec.csi.volumeHandle")
 	swapSourceToFSType       = flag.String("swap-source-to-fstype", "", "fs type of the --swap-source-to volume")
+	enableFailover           = flag.Bool("enable-failover", false, "allow PVs to have a failoverVolumeHandle; requires API access to PVs")
+	failoverStateDir         = flag.String("failover-state-dir", "/var/lib/kubelet/plugins/lustre-csi.hpe.com/failover", "node-local directory recording which side each failover volume was mounted from")
+	failoverForceUnmount     = flag.Bool("failover-force-unmount-stale", true, "force-unmount mounts of the side that a volume has failed away from")
+	operationTimeout         = flag.Duration("operation-timeout", 90*time.Second, "how long NodePublishVolume and NodeUnpublishVolume wait for a mount or an unmount. One that takes longer, e.g. because its Lustre servers are unreachable, continues in the background, and calls on the same target path fail with Aborted until it completes")
+	statfsTimeout            = flag.Duration("statfs-timeout", 30*time.Second, "how long a mounted volume may take to answer statfs before it is deemed unresponsive: NodeGetVolumeStats gives up on it, and NodeUnpublishVolume force-unmounts it")
+	lnetPing                 = flag.Bool("lnet-ping", true, "ping MGS NIDs over LNet, through /dev/lnet, to refuse mounts from unreachable MGSs and to report the LNet health of failover PVs")
+	lnetPingTimeout          = flag.Duration("lnet-ping-timeout", 5*time.Second, "how long an MGS NID may take to answer an LNet ping, at most 2m")
+	checkMGSBeforeMount      = flag.Bool("check-mgs-before-mount", true, "refuse to mount from an MGS whose NIDs answer no LNet ping, rather than wait for the mount to fail")
+	healthReportInterval     = flag.Duration("health-report-interval", 30*time.Second, "how often to report the LNet health of the MGSs of failover PVs in a per-node Lease; 0 to not report it. Requires --enable-failover and --lnet-ping")
+	healthNamespace          = flag.String("health-namespace", "", "namespace of the per-node health Leases; the driver's own if empty")
 )
 
 func main() {
@@ -80,6 +91,12 @@ func main() {
 	if swapSrc != "" && swapDst != "" {
 		klog.Infof("Swapping source '%s' to '%s' (%s) in volume handles", swapSrc, swapDst, swapDstFSType)
 	}
+	if *lnetPingTimeout < time.Second || *lnetPingTimeout > 2*time.Minute {
+		klog.Fatalln("--lnet-ping-timeout must be between 1s and 2m")
+	}
+	if *operationTimeout <= 0 || *statfsTimeout <= 0 || *healthReportInterval < 0 {
+		klog.Fatalln("--operation-timeout and --statfs-timeout must be positive, and --health-report-interval not negative")
+	}
 
 	handle()
 	os.Exit(0)
@@ -87,13 +104,23 @@ func main() {
 
 func handle() {
 	driverOptions := hpelustre.DriverOptions{
-		NodeID:                   *nodeID,
-		DriverName:               *driverName,
-		EnableHpeLustreMockMount: *enableHpeLustreMockMount,
-		WorkingMountDir:          *workingMountDir,
-		SwapSourceFrom:           swapSrc,
-		SwapSourceTo:             swapDst,
-		SwapSourceToFSType:       swapDstFSType,
+		NodeID:                    *nodeID,
+		DriverName:                *driverName,
+		EnableHpeLustreMockMount:  *enableHpeLustreMockMount,
+		WorkingMountDir:           *workingMountDir,
+		SwapSourceFrom:            swapSrc,
+		SwapSourceTo:              swapDst,
+		SwapSourceToFSType:        swapDstFSType,
+		EnableFailover:            *enableFailover,
+		FailoverStateDir:          *failoverStateDir,
+		FailoverForceUnmountStale: *failoverForceUnmount,
+		OperationTimeout:          *operationTimeout,
+		StatfsTimeout:             *statfsTimeout,
+		LNetPing:                  *lnetPing,
+		LNetPingTimeout:           *lnetPingTimeout,
+		CheckMGSBeforeMount:       *checkMGSBeforeMount,
+		HealthReportInterval:      *healthReportInterval,
+		HealthNamespace:           *healthNamespace,
 	}
 	driver := hpelustre.NewDriver(&driverOptions)
 	if driver == nil {

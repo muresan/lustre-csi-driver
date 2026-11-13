@@ -27,6 +27,7 @@ spec:
         app.kubernetes.io/component: plugin
     spec:
       priorityClassName: system-node-critical
+      serviceAccountName: lustre-csi-node
       initContainers:
         # When the CSI Driver hard crashes, it can leave around the socket used for communication between
         # the driver and the registrar, causing future driver executables to fail as the unix socket is
@@ -46,6 +47,7 @@ spec:
             - "-v=5"
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--nodeid=$(KUBE_NODE_NAME)"
+            - "--enable-failover"
           ports:
             - containerPort: 29763
               name: healthz

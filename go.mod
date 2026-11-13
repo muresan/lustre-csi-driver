@@ -7,8 +7,12 @@ require (
 	github.com/kubernetes-csi/csi-lib-utils v0.19.0
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/net v0.40.0
+	golang.org/x/sys v0.33.0
 	google.golang.org/grpc v1.71.0
 	google.golang.org/protobuf v1.36.5
+	k8s.io/api v0.31.6
+	k8s.io/apimachinery v0.31.6
+	k8s.io/client-go v0.31.6
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kubernetes v1.31.6
 	k8s.io/mount-utils v0.0.0
@@ -57,7 +61,6 @@ require (
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/oauth2 v0.25.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/term v0.32.0 // indirect
 	golang.org/x/text v0.25.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
@@ -66,11 +69,8 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/api v0.31.6 // indirect
 	k8s.io/apiextensions-apiserver v0.0.0 // indirect
-	k8s.io/apimachinery v0.31.6 // indirect
 	k8s.io/apiserver v0.31.6 // indirect
-	k8s.io/client-go v0.31.6 // indirect
 	k8s.io/component-base v0.31.6 // indirect
 	k8s.io/kube-openapi v0.0.0-20240228011516-70dd3763d340 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect

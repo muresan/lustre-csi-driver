@@ -1,13 +1,16 @@
 # Helm Charts
 
 This directory contains charts to deploy the lustre CSI driver with Helm.
-This deploys the [CSIDriver](lustre-csi-driver/templates/driver.yaml), 
-[DaemonSet](lustre-csi-driver/templates/plugin.yaml), and [Namespace](lustre-csi-driver/templates/namespace.yaml)
-Kubernetes resources.
+This deploys the [CSIDriver](v0.0.5/lustre-csi-driver/templates/driver.yaml),
+[DaemonSet](v0.0.5/lustre-csi-driver/templates/plugin.yaml), [Namespace](v0.0.5/lustre-csi-driver/templates/namespace.yaml),
+and [ServiceAccount](v0.0.5/lustre-csi-driver/templates/rbac.yaml) Kubernetes resources. With `failover.enabled=true`,
+it also deploys the RBAC that the node plugin needs for failover: reading PVs, and writing its health Lease and Events.
+See "Failover" in the [project README](../README.md#failover).
 
 ## To deploy from this workarea:
 
-- To deploy directly from this workarea: `cd charts/ && helm install lustre-csi-driver v0.0.4/lustre-csi-driver/ --values v0.0.4/lustre-csi-driver/values.yaml`
+- To deploy directly from this workarea: `cd charts/ && helm install lustre-csi-driver v0.0.5/lustre-csi-driver/ --values v0.0.5/lustre-csi-driver/values.yaml`
+- To enable failover, add `--set failover.enabled=true`
 - To shut down: `helm delete lustre-csi-driver`
 
 ### To deploy from a github repo

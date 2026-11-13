@@ -5,6 +5,7 @@ namespace: lustre-csi-system
 resources:
 - namespace.yaml
 - driver.yaml
+- rbac.yaml
 - plugin.yaml
 
 #patches:

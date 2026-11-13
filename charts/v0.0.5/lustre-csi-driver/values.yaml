@@ -1,0 +1,37 @@
+# Default values for lustre-csi-driver.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+deployment:
+  image: "ghcr.io/hewlettpackard/lustre-csi-driver"
+  tag: "master"
+
+# Failover of PVs between a primary and a failover Lustre filesystem, selected
+# by PV annotations. See "Failover" in the project's README.
+failover:
+  # Allow PVs to have a failoverVolumeHandle. The node plugin then reads PVs,
+  # and writes a health Lease per node and Events on nodes.
+  enabled: false
+  # Force-unmount mounts of the side that a volume has failed away from.
+  forceUnmountStale: true
+  # How often each node reports the LNet health of the MGSs of failover PVs in
+  # its Lease. "0s" to not report it.
+  healthReportInterval: 30s
+
+# How the node plugin copes with Lustre filesystems whose servers are
+# unreachable. See "Unreachable Filesystems" in the project's README.
+node:
+  # How long NodePublishVolume and NodeUnpublishVolume wait for a mount or an
+  # unmount, which then continues in the background.
+  operationTimeout: 90s
+  # How long a mounted volume may take to answer statfs before it is deemed
+  # unresponsive, and force-unmounted when unpublished.
+  statfsTimeout: 30s
+  lnetPing:
+    # Ping MGS NIDs over LNet, through /dev/lnet.
+    enabled: true
+    # How long an MGS NID may take to answer a ping. At most 2m.
+    timeout: 5s
+    # Refuse to mount from an MGS whose NIDs answer no ping, rather than wait
+    # for the mount to fail.
+    checkMGSBeforeMount: true

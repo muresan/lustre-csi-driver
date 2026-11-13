@@ -31,6 +31,7 @@ spec:
         app.kubernetes.io/version: {{ .Values.deployment.tag }}
     spec:
       priorityClassName: system-node-critical
+      serviceAccountName: lustre-csi-node
       initContainers:
         # When the CSI Driver hard crashes, it can leave around the socket used for communication between
         # the driver and the registrar, causing future driver executables to fail as the unix socket is
@@ -50,6 +51,16 @@ spec:
             - "-v=5"
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--nodeid=$(KUBE_NODE_NAME)"
+            - "--operation-timeout={{ .Values.node.operationTimeout }}"
+            - "--statfs-timeout={{ .Values.node.statfsTimeout }}"
+            - "--lnet-ping={{ .Values.node.lnetPing.enabled }}"
+            - "--lnet-ping-timeout={{ .Values.node.lnetPing.timeout }}"
+            - "--check-mgs-before-mount={{ .Values.node.lnetPing.checkMGSBeforeMount }}"
+            {{- if .Values.failover.enabled }}
+            - "--enable-failover"
+            - "--failover-force-unmount-stale={{ .Values.failover.forceUnmountStale }}"
+            - "--health-report-interval={{ .Values.failover.healthReportInterval }}"
+            {{- end }}
           ports:
             - containerPort: 29763
               name: healthz

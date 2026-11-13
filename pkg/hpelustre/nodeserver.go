@@ -17,6 +17,7 @@ limitations under the License.
 package hpelustre
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	volumehelper "github.com/HewlettPackard/lustre-csi-driver/pkg/util"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -35,43 +37,70 @@ import (
 
 // NodePublishVolume mount the volume from staging to target path
 func (d *Driver) NodePublishVolume(
-	_ context.Context,
+	ctx context.Context,
 	req *csi.NodePublishVolumeRequest,
 ) (*csi.NodePublishVolumeResponse, error) {
 
-	volCap := req.GetVolumeCapability()
-	if volCap == nil {
+	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument,
 			"Volume capability missing in request")
 	}
-	userMountFlags := volCap.GetMount().GetMountFlags()
-	volumeType := volCap.GetMount().GetFsType()
-
-	volumeID := req.GetVolumeId()
-	if len(volumeID) == 0 {
+	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument,
 			"Volume ID missing in request")
 	}
-
 	target := req.GetTargetPath()
 	if len(target) == 0 {
 		return nil, status.Error(codes.InvalidArgument,
 			"Target path not provided")
 	}
-
-	context := req.GetVolumeContext()
-	if context == nil {
+	if req.GetVolumeContext() == nil {
 		return nil, status.Error(codes.InvalidArgument,
 			"Volume context must be provided")
 	}
 
-	vol, err := getVolume(volumeID, context)
+	_, err := d.ops.do(ctx, target, "NodePublishVolume", d.operationTimeout, false,
+		func() (any, error) { return nil, d.publishVolume(req) })
 	if err != nil {
 		return nil, err
+	}
+	return &csi.NodePublishVolumeResponse{}, nil
+}
+
+// publishVolume mounts a volume at its target path. It may run on after
+// NodePublishVolume gave up waiting on it.
+func (d *Driver) publishVolume(req *csi.NodePublishVolumeRequest) error {
+	volCap := req.GetVolumeCapability()
+	userMountFlags := volCap.GetMount().GetMountFlags()
+	volumeType := volCap.GetMount().GetFsType()
+	volumeID := req.GetVolumeId()
+	target := req.GetTargetPath()
+	context := req.GetVolumeContext()
+
+	vol, err := getVolume(volumeID, context)
+	if err != nil {
+		return err
 	}
 
 	//source := getSourceString(vol.mgsIPAddress, vol.hpeLustreName)
 	source := volumeID
+
+	var failoverRec *failoverMount
+	if failoverHandle := context[VolumeContextFailoverVolumeHandle]; failoverHandle != "" {
+		if d.failover == nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"Volume %s has a %s, but failover is not enabled",
+				volumeID, VolumeContextFailoverVolumeHandle)
+		}
+		source, failoverRec, err = d.failover.resolve(volumeID, failoverHandle, target)
+		if err != nil {
+			return err
+		}
+		klog.V(2).Infof(
+			"NodePublishVolume: volume %s resolved to its %s %s, epoch %d",
+			volumeID, failoverRec.Side, source, failoverRec.Epoch,
+		)
+	}
 
 	mountOptions, readOnly := getMountOptions(req, userMountFlags)
 
@@ -79,7 +108,7 @@ func (d *Driver) NodePublishVolume(
 		interpolatedSubDir := interpolateSubDirVariables(context, vol)
 
 		if isSubpath := ensureStrictSubpath(interpolatedSubDir); !isSubpath {
-			return nil, status.Error(
+			return status.Error(
 				codes.InvalidArgument,
 				"Context sub-dir must be strict subpath",
 			)
@@ -94,7 +123,7 @@ func (d *Driver) NodePublishVolume(
 			)
 
 			if err = d.createSubDir(vol, target, interpolatedSubDir, mountOptions); err != nil {
-				return nil, err
+				return err
 			}
 		}
 
@@ -107,7 +136,7 @@ func (d *Driver) NodePublishVolume(
 
 	mnt, err := d.ensureMountPoint(target)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal,
+		return status.Errorf(codes.Internal,
 			"Could not mount target %q: %v",
 			target,
 			err)
@@ -118,7 +147,18 @@ func (d *Driver) NodePublishVolume(
 			volumeID,
 			target,
 		)
-		return &csi.NodePublishVolumeResponse{}, nil
+		return d.recordFailover(target, failoverRec)
+	}
+
+	if err := d.checkMGS(source, failoverRec); err != nil {
+		return err
+	}
+
+	// Record which side is mounted before mounting it, so that a mount is
+	// never left without a record of its side should the driver stop
+	// before the mount completes.
+	if err := d.recordFailover(target, failoverRec); err != nil {
+		return err
 	}
 
 	//klog.V(2).Infof(
@@ -137,22 +177,24 @@ func (d *Driver) NodePublishVolume(
 		)
 		if err := volumehelper.MakeDir(target); err != nil {
 			klog.Errorf("MakeDir failed on target: %s (%v)", target, err)
-			return nil, err
+			d.forgetFailover(target, failoverRec)
+			return err
 		}
-		return &csi.NodePublishVolumeResponse{}, nil
+		return nil
 	}
 
 	err = mountVolumeAtPath(d, source, target, volumeType, mountOptions)
 	if err != nil {
+		d.forgetFailover(target, failoverRec)
 		if removeErr := os.Remove(target); removeErr != nil {
-			return nil, status.Errorf(
+			return status.Errorf(
 				codes.Internal,
 				"Could not remove mount target %q: %v",
 				target,
 				removeErr,
 			)
 		}
-		return nil, status.Errorf(codes.Internal,
+		return status.Errorf(codes.Internal,
 			"Could not mount %q at %q: %v", source, target, err)
 	}
 
@@ -168,7 +210,55 @@ func (d *Driver) NodePublishVolume(
 		target,
 	)
 
-	return &csi.NodePublishVolumeResponse{}, nil
+	return nil
+}
+
+// recordFailover records which side a volume with a failover volume handle
+// is published from.
+func (d *Driver) recordFailover(target string, rec *failoverMount) error {
+	if rec == nil {
+		return nil
+	}
+	if err := d.failover.record(target, rec); err != nil {
+		return status.Errorf(codes.Internal,
+			"Could not record failover state for %q: %v", target, err)
+	}
+	return nil
+}
+
+// forgetFailover drops the record of a volume that failed to be published.
+func (d *Driver) forgetFailover(target string, rec *failoverMount) {
+	if rec == nil {
+		return
+	}
+	if err := d.failover.forget(target); err != nil {
+		klog.Warningf("Could not forget failover state of %q: %v", target, err)
+	}
+}
+
+// checkMGS refuses to mount source if its MGS doesn't answer LNet pings,
+// rather than letting the mount block for minutes until it fails.
+func (d *Driver) checkMGS(source string, rec *failoverMount) error {
+	if d.health == nil || !d.checkMGSBeforeMount || d.enableHpeLustreMockMount ||
+		(d.swapSourceFrom != "" && source == d.swapSourceFrom) {
+		return nil
+	}
+	mgs, _, err := splitSource(source)
+	if err != nil {
+		return nil
+	}
+	h := d.health.check(mgs, mountCheckMaxAge)
+	if h.State != SideUnreachable {
+		return nil
+	}
+	hint := ""
+	if rec != nil {
+		hint = fmt.Sprintf(". It is the %s side of volume %s: if its site is down, fail the volume over",
+			rec.Side, rec.VolumeID)
+	}
+	return status.Errorf(codes.Unavailable,
+		"Not mounting %s: its MGS has not answered LNet pings from this node since %s (%s)%s",
+		source, h.Since.Format(time.RFC3339), h.Detail, hint)
 }
 
 func interpolateSubDirVariables(context map[string]string, vol *lustreVolume) string {
@@ -247,8 +337,14 @@ func xx_getVolume(volumeID string, context map[string]string) (*lustreVolume, er
 }
 
 func mountVolumeAtPath(d *Driver, source, target string, volumeType string, mountOptions []string) error {
-	d.kernelModuleLock.Lock()
-	defer d.kernelModuleLock.Unlock()
+	// The first mount on a node loads the Lustre kernel modules. As a
+	// precaution, mounts are serialized until they are loaded, but no longer:
+	// a mount from an unreachable MGS blocks for minutes, and must not hold
+	// up the mounts of other volumes.
+	if !d.lustreModulesLoaded() {
+		d.kernelModuleLock.Lock()
+		defer d.kernelModuleLock.Unlock()
+	}
 	klog.Infof("Mount source '%s' (%s) at '%s', with options (%s)", source, volumeType, target, mountOptions)
 	if d.swapSourceFrom != "" && source == d.swapSourceFrom {
 		klog.Warningf("Swapping source '%s' to '%s' (%s) in mountVolumeAtPath", d.swapSourceFrom, d.swapSourceTo, d.swapSourceToFSType)
@@ -268,7 +364,7 @@ func mountVolumeAtPath(d *Driver, source, target string, volumeType string, moun
 
 // NodeUnpublishVolume unmount the volume from the target path
 func (d *Driver) NodeUnpublishVolume(
-	_ context.Context,
+	ctx context.Context,
 	req *csi.NodeUnpublishVolumeRequest,
 ) (*csi.NodeUnpublishVolumeResponse, error) {
 
@@ -286,10 +382,10 @@ func (d *Driver) NodeUnpublishVolume(
 
 	klog.V(2).Infof("NodeUnpublishVolume: unmounting volume %s on %s",
 		volumeID, targetPath)
-	err := unmountVolumeAtPath(d, targetPath)
+	_, err := d.ops.do(ctx, targetPath, "NodeUnpublishVolume", d.operationTimeout, false,
+		func() (any, error) { return nil, d.unpublishVolume(targetPath) })
 	if err != nil {
-		return nil, status.Errorf(codes.Internal,
-			"failed to unmount target %q: %v", targetPath, err)
+		return nil, err
 	}
 	klog.V(2).Infof(
 		"NodeUnpublishVolume: unmount volume %s on %s successfully",
@@ -300,46 +396,102 @@ func (d *Driver) NodeUnpublishVolume(
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func unmountVolumeAtPath(d *Driver, targetPath string) error {
-	shouldUnmountBadPath := false
-
-	d.kernelModuleLock.Lock()
-	defer d.kernelModuleLock.Unlock()
-
-	parent := filepath.Dir(targetPath)
-	klog.V(2).Infof("Listing dir: %s", parent)
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		klog.Warningf("could not list directory %s, will explicitly unmount path before cleanup %s: %q", parent, targetPath, err)
-		shouldUnmountBadPath = true
+// unpublishVolume unmounts a volume from its target path. It may run on after
+// NodeUnpublishVolume gave up waiting on it.
+func (d *Driver) unpublishVolume(targetPath string) error {
+	if err := unmountVolumeAtPath(d, targetPath); err != nil {
+		return status.Errorf(codes.Internal,
+			"failed to unmount target %q: %v", targetPath, err)
 	}
+	if d.failover != nil {
+		if err := d.failover.forget(targetPath); err != nil {
+			return status.Errorf(codes.Internal,
+				"failed to forget failover state of %q: %v", targetPath, err)
+		}
+	}
+	return nil
+}
 
-	for _, e := range entries {
-		if e.Name() == filepath.Base(targetPath) {
-			_, err := e.Info()
-			if err != nil {
-				klog.Warningf("could not get info for entry %s, will explicitly unmount path before cleanup %s: %q", e.Name(), targetPath, err)
-				shouldUnmountBadPath = true
+// How many mounts stacked on a target path to unmount.
+const maxStackedMounts = 8
+
+// unmountVolumeAtPath unmounts targetPath and removes it, without blocking
+// on a filesystem whose servers are unreachable. It tells whether
+// targetPath is mounted from /proc/self/mountinfo rather than by stat'ing
+// it, which would block. It unmounts with umount(2), which doesn't look up
+// the mounted filesystem's root, rather than with umount(8), which stats
+// it. And it force-unmounts a filesystem that doesn't answer statfs in time,
+// since a plain unmount would then block on flushing it, and Lustre aborts
+// the outstanding RPCs of a forced unmount.
+func unmountVolumeAtPath(d *Driver, targetPath string) error {
+	for range maxStackedMounts {
+		mnt, err := d.findMount(targetPath)
+		if err != nil {
+			return err
+		}
+		if mnt == nil {
+			break
+		}
+		flags := 0
+		if err := d.checkResponsive(targetPath, mnt); err != nil {
+			klog.Warningf("%s does not respond, force-unmounting it: %v", targetPath, err)
+			flags = unix.MNT_FORCE
+		}
+		klog.V(4).Infof("Unmounting %s (%s from %s), flags %#x", targetPath, mnt.FsType, mnt.Source, flags)
+		err = d.unmount(targetPath, flags)
+		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOENT) {
+			// Not or no longer a mount point.
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("could not unmount %s: %w", targetPath, err)
+		}
+	}
+	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("could not remove %s: %w", targetPath, err)
+	}
+	return nil
+}
+
+// checkResponsive checks that the filesystem mounted at path answers statfs
+// in time. It waits less if the filesystem's MGS was last seen not answering
+// LNet pings.
+func (d *Driver) checkResponsive(path string, mnt *mount.MountInfo) error {
+	timeout := d.statfsTimeout
+	if d.health != nil && mnt.FsType == "lustre" {
+		if mgs, _, err := splitSource(mnt.Source); err == nil {
+			if h := d.health.cached(mgs, unmountCheckMaxAge); h.State == SideUnreachable {
+				timeout = min(timeout, d.lnetPingTimeout)
 			}
 		}
 	}
+	_, err := d.volumeStats(context.Background(), path, timeout)
+	return err
+}
 
-	if shouldUnmountBadPath {
-		// In these cases, if we only ran mount.CleanupMountWithForce,
-		// it would have issues trying to stat the directory before
-		// cleanup, so we need to explicitly unmount the path, with
-		// force if necessary. Then the directory can be cleaned up
-		// by the mount.CleanupMountWithForce call.
-		klog.V(4).Infof("unmounting bad mount: %s)", targetPath)
-		forceUnmounter := *d.forceMounter
-		if err := forceUnmounter.UnmountWithForce(targetPath, 30*time.Second); err != nil {
-			klog.Warningf("couldn't unmount %s: %q", targetPath, err)
+// findMount returns the topmost mount at path, or nil if path is not a mount
+// point. Unlike stat, reading /proc/self/mountinfo never calls into the
+// mounted filesystem, so it can't block on unreachable servers.
+func findMount(path string) (*mount.MountInfo, error) {
+	infos, err := mount.ParseMountInfo("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	path = filepath.Clean(path)
+	var found *mount.MountInfo
+	for i := range infos {
+		if infos[i].MountPoint == path {
+			found = &infos[i]
 		}
 	}
+	return found, nil
+}
 
-	err = mount.CleanupMountWithForce(targetPath, *d.forceMounter,
-		true /*extensiveMountPointCheck*/, 10*time.Second)
-	return err
+// lustreModulesLoaded reports whether the Lustre client kernel modules are
+// loaded.
+func lustreModulesLoaded() bool {
+	_, err := os.Stat("/sys/module/lustre")
+	return err == nil
 }
 
 // Staging and Unstaging is not able to be supported with how Lustre is mounted
@@ -425,7 +577,7 @@ func (d *Driver) NodeGetInfo(
 
 // NodeGetVolumeStats get volume stats
 func (d *Driver) NodeGetVolumeStats(
-	_ context.Context,
+	ctx context.Context,
 	req *csi.NodeGetVolumeStatsRequest,
 ) (*csi.NodeGetVolumeStatsResponse, error) {
 	if len(req.GetVolumeId()) == 0 {
@@ -438,6 +590,24 @@ func (d *Driver) NodeGetVolumeStats(
 			"NodeGetVolumeStats volume path was empty")
 	}
 
+	return d.volumeStats(ctx, volumePath, d.statfsTimeout)
+}
+
+// volumeStats returns the usage of the volume mounted at path, giving up
+// after timeout. Calls share a statfs in progress, which counts towards the
+// timeout, so that kubelet's periodic calls on a volume whose servers are
+// unreachable don't each leave another thread blocked in statfs.
+func (d *Driver) volumeStats(ctx context.Context, path string, timeout time.Duration) (*csi.NodeGetVolumeStatsResponse, error) {
+	val, err := d.statfsOps.do(ctx, path, "statfs", timeout, true,
+		func() (any, error) { return d.statVolume(path) })
+	if err != nil {
+		return nil, err
+	}
+	return val.(*csi.NodeGetVolumeStatsResponse), nil
+}
+
+// statVolume returns the usage of the volume mounted at volumePath.
+func statVolume(volumePath string) (*csi.NodeGetVolumeStatsResponse, error) {
 	if _, err := os.Lstat(volumePath); err != nil {
 		if os.IsNotExist(err) {
 			return nil, status.Errorf(codes.NotFound,

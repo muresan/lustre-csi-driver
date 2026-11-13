@@ -1,0 +1,93 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lustre-csi-node
+  namespace: lustre-csi-system
+  labels:
+    app.kubernetes.io/instance: lustre-csi.hpe.com
+    app.kubernetes.io/part-of: lustre-csi-driver
+    app.kubernetes.io/name: lustre-csi-node
+    app.kubernetes.io/component: plugin
+    app.kubernetes.io/version: {{ .Values.deployment.tag }}
+{{- if .Values.failover.enabled }}
+---
+# The node plugin watches PVs for the failover annotations of those with a
+# failoverVolumeHandle. It reports the LNet health of their MGSs in a Lease per
+# node, owned by the node, and in Events on the node.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lustre-csi-node
+  labels:
+    app.kubernetes.io/instance: lustre-csi.hpe.com
+    app.kubernetes.io/part-of: lustre-csi-driver
+    app.kubernetes.io/name: lustre-csi-node
+    app.kubernetes.io/component: plugin
+    app.kubernetes.io/version: {{ .Values.deployment.tag }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lustre-csi-node
+  labels:
+    app.kubernetes.io/instance: lustre-csi.hpe.com
+    app.kubernetes.io/part-of: lustre-csi-driver
+    app.kubernetes.io/name: lustre-csi-node
+    app.kubernetes.io/component: plugin
+    app.kubernetes.io/version: {{ .Values.deployment.tag }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lustre-csi-node
+subjects:
+  - kind: ServiceAccount
+    name: lustre-csi-node
+    namespace: lustre-csi-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lustre-csi-node-health
+  namespace: lustre-csi-system
+  labels:
+    app.kubernetes.io/instance: lustre-csi.hpe.com
+    app.kubernetes.io/part-of: lustre-csi-driver
+    app.kubernetes.io/name: lustre-csi-node
+    app.kubernetes.io/component: plugin
+    app.kubernetes.io/version: {{ .Values.deployment.tag }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lustre-csi-node-health
+  namespace: lustre-csi-system
+  labels:
+    app.kubernetes.io/instance: lustre-csi.hpe.com
+    app.kubernetes.io/part-of: lustre-csi-driver
+    app.kubernetes.io/name: lustre-csi-node
+    app.kubernetes.io/component: plugin
+    app.kubernetes.io/version: {{ .Values.deployment.tag }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lustre-csi-node-health
+subjects:
+  - kind: ServiceAccount
+    name: lustre-csi-node
+    namespace: lustre-csi-system
+{{- end }}

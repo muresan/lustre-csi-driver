@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-failover-example
+  annotations:
+    # Which handle to mount: "primary" (the default), "failover", or
+    # "draining" to refuse new mounts. Changed by tools/lustre-failover.sh.
+    lustre-csi.hpe.com/failover-active: primary
+    # Bumped on every failover. Mounts from an older epoch are stale.
+    lustre-csi.hpe.com/failover-epoch: "1"
+spec:
+  capacity:
+    storage: 1Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  storageClassName: lustre-fs
+  persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    kind: PersistentVolumeClaim
+    name: pvc-example
+    namespace: default
+  csi:
+    driver: lustre-csi.hpe.com
+    # The primary filesystem.
+    volumeHandle: "10.0.0.1@o2ib,10.0.0.2@o2ib:10.0.0.3@o2ib,10.0.0.4@o2ib:/fz2aw"
+    fsType: lustre
+    volumeAttributes:
+      # The failover filesystem, in the same form as the volumeHandle.
+      failoverVolumeHandle: "10.1.0.1@o2ib,10.1.0.2@o2ib:10.1.0.3@o2ib,10.1.0.4@o2ib:/fz2bw"

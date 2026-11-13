@@ -11,6 +11,7 @@
 - [Steps for Releasing a Version](#steps-for-releasing-a-version)
 - [Local Testing, Without a Real Lustre Filesystem](#local-testing-without-a-real-lustre-filesystem)
 - [Read-Only Mount](#read-only-mount)
+- [Failover](#failover)
 - [OpenShift Lustre Client Install](#openshift-lustre-client-install)
 - [CSI NodeStageVolume vs NodePublishVolume](#csi-nodestagevolume-vs-nodepublishvolume)
 
@@ -40,12 +41,12 @@ This describes methods of deploying the Lustre CSI driver in various environment
 You can use Helm to manage the lustre CSI driver components, installing from your local workarea rather than using a chart repo:
 
 - To pick a release: `git tag`. Then pick a tag with `git checkout $RELEASE_TAG`
-- To deploy: `cd charts/ && helm install lustre-csi-driver v0.0.4/lustre-csi-driver/ --values v0.0.4/lustre-csi-driver/values.yaml`
+- To deploy: `cd charts/ && helm install lustre-csi-driver v0.0.5/lustre-csi-driver/ --values v0.0.5/lustre-csi-driver/values.yaml`
 - To shut down: `helm delete lustre-csi-driver`
 
 For a development build, to install a specific image tag, use the following:
 
-- `cd charts/ && helm install lustre-csi-driver v0.0.4/lustre-csi-driver/ --values v0.0.4/lustre-csi-driver/values.yaml --set deployment.tag=0.0.0.126-4fee`
+- `cd charts/ && helm install lustre-csi-driver v0.0.5/lustre-csi-driver/ --values v0.0.5/lustre-csi-driver/values.yaml --set deployment.tag=0.0.0.126-4fee`
 
 #### Helm chart repo
 
@@ -55,7 +56,7 @@ After any change to the `charts/` directory, the chart package and index must be
 
 When modifying the chart, bump the chart version with the following steps:
 
-- Move the current chart version dir, following semantic versioning rules: `git mv charts/v0.0.4 charts/v0.0.5`.
+- Move the current chart version dir, following semantic versioning rules: `git mv charts/v0.0.5 charts/v0.0.6`.
 - Update the chart version to match in its Chart.yaml file: `make helm-chart-version`
 - Repackage the chart: `make helm-repackage`
 - Reindex the chart: `make helm-reindex`
@@ -169,6 +170,96 @@ advise the k8s scheduler about pod placement.
 
 - PVC `.spec.accessModes` is loosely used to match a PV. The PV access mode is what matters.
 
+
+## Failover
+
+A PV can name two Lustre filesystems, a primary and a failover, kept in sync outside of Kubernetes. Only one of them is active at a time, and the PV mounts whichever one it is. Failing over restarts the pods using the PV. Running pods don't move over transparently, because files they have open stay on the old filesystem.
+
+The failover filesystem goes in the `failoverVolumeHandle` volume attribute, in the same `<mgs nids>:/<fsname>[/<subdir>]` form as the `volumeHandle`. The two filesystems may have different fsnames, as in the example below, or the same one. Two annotations select the active one (see [example_pv_failover.yaml](./deploy/kubernetes/base/example_pv_failover.yaml)):
+
+```yaml
+metadata:
+  annotations:
+    lustre-csi.hpe.com/failover-active: primary
+    lustre-csi.hpe.com/failover-epoch: "1"
+spec:
+  csi:
+    driver: lustre-csi.hpe.com
+    volumeHandle: "10.0.0.1@o2ib,10.0.0.2@o2ib:10.0.0.3@o2ib,10.0.0.4@o2ib:/fz2aw"
+    fsType: lustre
+    volumeAttributes:
+      failoverVolumeHandle: "10.1.0.1@o2ib,10.1.0.2@o2ib:10.1.0.3@o2ib,10.1.0.4@o2ib:/fz2bw"
+```
+
+- `lustre-csi.hpe.com/failover-active`: `primary` (the default), `failover`, or `draining` to refuse new mounts.
+- `lustre-csi.hpe.com/failover-epoch`: bumped on every failover. Defaults to 0.
+
+PVs that share a `volumeHandle` must agree on these annotations.
+
+On each node, the driver records which side and epoch every such volume is published from, under `--failover-state-dir`, before mounting it. A mount of the side that is no longer active, or from an older epoch, is stale. Stale mounts are force-unmounted with `MNT_FORCE`, unless `--failover-force-unmount-stale=false`. This makes Lustre abort the outstanding RPCs, so processes blocked on an unreachable server get errors and exit. The pod must still be restarted. A failed force-unmount is retried every 30 seconds.
+
+Draining makes nothing stale, so pods can be stopped gracefully for a planned switchover.
+
+A node also never mounts a Lustre fsname from one MGS while it still has that fsname published from a different MGS. Two MGS NID lists count as the same MGS if they share a NID. This rule only matters when the primary and failover filesystems share an fsname. Pods that would break it wait in `ContainerCreating`, as they do while a volume is draining, until the other mounts are unpublished. With different fsnames, as in the example, the rule never applies, and a replacement pod mounts the new side at once, even on a node that still has the old side mounted.
+
+Failover is enabled by `--enable-failover`, which the kustomize deployment sets. With Helm, set `failover.enabled=true`. The chart's [values.yaml](./charts/v0.0.5/lustre-csi-driver/values.yaml) also has the settings described below. The node plugin then needs to read PVs, and to write its health Lease and Events (see [rbac.yaml](./deploy/kubernetes/base/rbac.yaml)). PVs without a `failoverVolumeHandle` are not affected. Without `--enable-failover`, PVs with one fail to mount.
+
+### Unreachable Filesystems
+
+When the servers of a Lustre filesystem are down, for example after a power loss at its site, calls on it block in the kernel until the servers return or the mount is force-unmounted. The node plugin keeps such a filesystem from holding up volumes on other filesystems, and from piling up blocked threads. This applies to all volumes, not only those with a `failoverVolumeHandle`.
+
+- `NodePublishVolume` and `NodeUnpublishVolume` give up waiting after `--operation-timeout` (90s by default) and let the mount or unmount finish in the background. Until it does, further calls on the same target path fail with `Aborted`. Calls on other target paths don't wait on each other. The only exception is that mounts are serialized until the Lustre kernel modules are loaded.
+- Before mounting, the plugin pings the MGS NIDs over LNet, as `lctl ping` does, but through `/dev/lnet` directly, so no Lustre tools are needed in the image. If no NID of the MGS answers within `--lnet-ping-timeout` (5s), the mount is refused with an `Unavailable` error instead of blocking for minutes. For a failover volume, the error names the side to fail over from. If the ping can't be made at all, for example because LNet isn't up on the node yet, the mount goes ahead. `--check-mgs-before-mount=false` turns this check off, and `--lnet-ping=false` turns off pinging entirely.
+- `NodeUnpublishVolume` finds mounts in `/proc/self/mountinfo` instead of calling stat on them, and unmounts with `umount(2)` instead of `umount(8)`, which also stats the target. If the filesystem doesn't answer `statfs` within `--statfs-timeout` (30s), it is force-unmounted. When its MGS was last found unreachable, the plugin waits only `--lnet-ping-timeout`. Writes still unflushed by the pod, which has exited by then, are lost.
+- `NodeGetVolumeStats` gives up after `--statfs-timeout`, and doesn't start another `statfs` of a volume while an earlier one is still blocked.
+
+None of this unblocks a pod using an unreachable filesystem. It stays blocked until the servers return or its volume fails over.
+
+### Health Reporting
+
+With `--enable-failover`, each node plugin pings the MGSs of both sides of all failover PVs every `--health-report-interval` (30s by default). It reports the result in a Lease named `lustre-csi-health-<node>`, in the driver's namespace and owned by the node:
+
+```yaml
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: lustre-csi-health-node1
+  labels:
+    app.kubernetes.io/component: lnet-health
+    app.kubernetes.io/part-of: lustre-csi-driver
+  annotations:
+    lustre-csi.hpe.com/lnet-health: '[{"mgs":"10.0.0.1@o2ib,10.0.0.2@o2ib:10.0.0.3@o2ib,10.0.0.4@o2ib","state":"Unreachable","since":"...","checked":"...","detail":"10.0.0.1@o2ib: input/output error; ..."}, ...]'
+spec:
+  holderIdentity: node1
+  leaseDurationSeconds: 90
+  renewTime: "..."
+```
+
+`state` is `Reachable`, `Unreachable`, or `Unknown` when the node can't ping. `since` is when the state last changed. A Lease that hasn't been renewed within `leaseDurationSeconds` is stale, meaning its node or plugin is down. Nodes also record `LustreMGSUnreachable` and `LustreMGSReachable` Events on themselves when an MGS changes state.
+
+Automation can use these to decide when to fail over, for example when most nodes find the active side unreachable and the other side reachable. Without that agreement, one node's network problem could pass for a site outage. `tools/lustre-failover.sh health` summarizes the Leases. The driver never fails over by itself.
+
+### Switching Sides
+
+[tools/lustre-failover.sh](./tools/lustre-failover.sh) changes the annotations of a selection of PVs and restarts the pods using them. Select PVs with `-A` (all PVs with a `failoverVolumeHandle`), `-l <label selector>` or `-p <pv>`. Select all the PVs on a filesystem together; the script warns about PVs left out. Making a filesystem read-only or writable to the Kubernetes nodes (for example with Lustre nodemaps) and controlling replication are done by a site-specific hook given with `-k`, or by hand when prompted. `tools/lustre-failover.sh -A health` shows how many nodes reach the MGS of each side.
+
+Planned switchover, with both filesystems up: `tools/lustre-failover.sh -A switchover failover`
+
+1. Drain the PVs, and delete the pods using them. Their replacements wait.
+2. Once the pods are gone, so are all mounts of the old side. Make it read-only, wait for replication to catch up, and make the new side writable.
+3. Activate the new side. The replacement pods mount it.
+
+If pods are still terminating after `-t` seconds (600 by default), the switchover stops and leaves the PVs draining. Run it again once the pods are gone, or roll back with `tools/lustre-failover.sh -A undrain primary`.
+
+Unplanned failover, with the active filesystem down: `tools/lustre-failover.sh -A failover failover`
+
+1. Make the new side writable, and activate it. Nodes force-unmount mounts of the old side.
+2. Delete the pods using the PVs. Their replacements mount the new side.
+3. Writes not yet replicated from the old side are lost. Make the old side read-only to the Kubernetes nodes before it serves clients again, then reverse replication.
+
+The script warns if nodes still reach the MGS of the old side, since a planned switchover would then lose no writes. A failover doesn't stop for pods that are slow to terminate; it lists them instead.
+
+Force-deleting a pod that is stuck terminating doesn't release its mount. If the two sides share an fsname, its node keeps refusing to mount the other side until kubelet has unpublished the volume. Pods on a node that is down stay terminating until the node returns, or is given the `node.kubernetes.io/out-of-service` taint.
 
 ## OpenShift Lustre Client Install
 RedHat CoreOS (RHCOS) is an immutable OS that requires the use of a Kernel Module Manager (KMM) operator to orchestrate the building and insertion of 3rd party kernel modules (i.e. Lustre client kernel modules). So, users will need to install a KMM operator prior to following these instructions. Additionally, the KMM build must include entitlement keys associated with your Red Hat subscription to access required RHEL content during the build process.
